@@ -40,7 +40,7 @@ Follow these steps to set up the dashboard on your local machine.
 ### 2. Installation
 Clone the repository and install dependencies:
 ```bash
-git clone https://github.com/YOUR_USERNAME/Traffic-Detection-System.git
+git clone https://github.com/VatsalJoshi0/Traffic-Detection-System.git
 cd Traffic-Detection-System
 pip install -r requirements.txt
 ```
