@@ -76,11 +76,6 @@ traffic_app/
     └── support.py        # Help Center
 ```
 
-## 👥 Contributors
-- **[Your Name]** - Frontend Developer (Streamlit)
-- **[Teammate Name]** - Backend Developer (Flask/AI)
-
----
 
 ## 📜 License
 This project is part of the Code Unnati Innovation Program.
