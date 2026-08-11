@@ -76,6 +76,9 @@ CLASS_AMBULANCE:   int = 7   # override / retrain for custom ambulance class
 # Vehicle classes eligible for in-cabin checks
 VEHICLE_CLASSES: Tuple[int, ...] = (CLASS_CAR, CLASS_BUS, CLASS_TRUCK)
 
+# Emergency vehicle classes (heuristic check will be applied to these)
+POTENTIAL_EMERGENCY_CLASSES: Tuple[int, ...] = (CLASS_CAR, CLASS_BUS, CLASS_TRUCK, CLASS_AMBULANCE)
+
 # ── Wrong-lane analysis parameters ─────────────────────────────────────────
 TRAJECTORY_WINDOW:    int   = 30    # rolling frames for slope computation
 WRONG_LANE_DELTA_Y:   int   = -30  # px: upward displacement threshold (top-to-bottom flow)
@@ -192,6 +195,12 @@ class VisionPipeline:
         # ── Violation deduplication: set of (track_id, violation_type) ──
         self._logged_events: set = set()
         
+        # ── Active visual highlights for violations ──────────────────────
+        self._active_highlights: Dict[int, Dict[str, Any]] = {}
+        
+        # ── Frame Skipping Cache ─────────────────────────────────────────
+        self._last_annotated_frame: Optional[np.ndarray] = None
+
         # ── Ingestion Loop State ─────────────────────────────────────────
         self.video_source: Any = 0
         self.latest_jpeg: bytes = b''
@@ -299,12 +308,28 @@ class VisionPipeline:
         """
         Main entry point. Accepts a raw BGR frame, runs all detection
         and violation checks, returns an annotated BGR frame.
+
+        Frame-skipping strategy (FIX): Full YOLO inference runs only on every 3rd frame
+        (frame_idx % 3 == 0), reducing the effective model inference rate to ~10 fps
+        on a 30fps source while still returning an annotated canvas every frame.
+        This caps per-frame inference time overhead and keeps the pipeline within the
+        35ms budget on CPU-only deployments. On GPU, the skip can be reduced or removed.
         """
         self._frame_index += 1
         frame_idx = self._frame_index
 
         # Step 1 — Resize to fixed processing canvas
         canvas = cv2.resize(frame, (PROCESS_W, PROCESS_H))
+
+        # FIX: Frame skipping — run YOLO inference only on every 3rd frame.
+        # On skip frames, return the last annotated canvas to maintain stream continuity.
+        if frame_idx % 3 != 0:
+            if getattr(self, '_last_annotated_frame', None) is not None:
+                return self._last_annotated_frame.copy()
+            # Fallback if no frame has been annotated yet
+            annotated = self._draw_roi(canvas)
+            annotated = self._draw_status_banner(annotated)
+            return annotated
 
         # Step 2 — YOLO inference with ByteTrack persistent tracking
         results = self.model.track(
@@ -339,7 +364,7 @@ class VisionPipeline:
         self._update_trajectories(boxes, class_ids, track_ids, frame_idx)
 
         # Step 4 — Emergency vehicle detection (runs before everything else)
-        self._check_emergency_override(class_ids, track_ids, canvas, frame_idx)
+        self._check_emergency_override(class_ids, track_ids, canvas, frame_idx, boxes=boxes)
 
         # Step 5 — Run violation detectors only when no emergency lock is active
         if not self.emergency_active:
@@ -357,6 +382,12 @@ class VisionPipeline:
         annotated = result.plot()  # built-in ultralytics overlay
         annotated = self._draw_roi(annotated)
         annotated = self._draw_status_banner(annotated)
+        
+        # Draw active violation highlights
+        annotated = self._draw_highlights(annotated)
+        
+        # Cache for frame skipping
+        self._last_annotated_frame = annotated.copy()
 
         return annotated
 
@@ -400,8 +431,14 @@ class VisionPipeline:
     def trigger_manual_override(self, active: bool) -> None:
         """
         Allows external callers (e.g. FastAPI endpoint) to force-set emergency state.
+
+        BUG FIX: Now persists _manual_override_explicit so that reset_state() (triggered
+        on video source switches / file loops) does NOT silently clear a manually-set
+        emergency override. Previously, getattr() always returned False because this
+        attribute was never assigned.
         """
         self.emergency_active = active
+        self._manual_override_explicit = active   # FIX: persist explicit flag
         state = "ACTIVE" if active else "CLEARED"
         logger.warning("Manual emergency override: %s", state)
 
@@ -439,6 +476,7 @@ class VisionPipeline:
         track_ids: np.ndarray,
         canvas: np.ndarray,
         frame_idx: int,
+        boxes: Optional[np.ndarray] = None,
     ) -> None:
         """
         Detects ambulance/emergency vehicle class in current frame.
@@ -448,20 +486,34 @@ class VisionPipeline:
         active_emergency_ids = set()
 
         for i, cls in enumerate(class_ids):
-            if cls == CLASS_AMBULANCE:
-                tid = int(track_ids[i]) if track_ids[i] >= 0 else -1
-                active_emergency_ids.add(tid)
+            if cls in POTENTIAL_EMERGENCY_CLASSES:
+                # Use bounding box to check color heuristics since COCO lacks emergency classes
+                is_emergency = False
+                if boxes is not None:
+                    x1, y1, x2, y2 = (int(v) for v in boxes[i])
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(PROCESS_W, x2), min(PROCESS_H, y2)
+                    if y2 > y1 and x2 > x1:
+                        crop = canvas[y1:y2, x1:x2]
+                        is_emergency = self._is_emergency_vehicle(crop)
+                
+                # If using custom model where CLASS_AMBULANCE is correctly defined without overlap:
+                # is_emergency = is_emergency or (cls == CLASS_AMBULANCE and cls != CLASS_TRUCK)
 
-                if not self.emergency_active:
-                    logger.warning(
-                        "Frame %d: Emergency vehicle detected (track_id=%d). "
-                        "System LOCKED. All violation checks suspended.",
-                        frame_idx, tid,
-                    )
-                self.emergency_active = True
-                self._emergency_track_ids.add(tid)
-                # Reset dropout counter every frame it's visible
-                self._emergency_dropout_counters[tid] = EMERGENCY_DROPOUT_RESET
+                if is_emergency:
+                    tid = int(track_ids[i]) if track_ids[i] >= 0 else -1
+                    active_emergency_ids.add(tid)
+
+                    if not self.emergency_active:
+                        logger.warning(
+                            "Frame %d: Emergency vehicle detected (track_id=%d). "
+                            "System LOCKED. All violation checks suspended.",
+                            frame_idx, tid,
+                        )
+                    self.emergency_active = True
+                    self._emergency_track_ids.add(tid)
+                    # Reset dropout counter every frame it's visible
+                    self._emergency_dropout_counters[tid] = EMERGENCY_DROPOUT_RESET
 
         # Check for IDs that have now dropped out of frame
         departed_ids = self._emergency_track_ids - active_emergency_ids
@@ -506,7 +558,15 @@ class VisionPipeline:
         Flow logic (640×480 canvas, y increases downward):
         - 'top_to_bottom': normal = Δy > 0. Wrong lane = Δy < WRONG_LANE_DELTA_Y (i.e. < -30 px).
         - 'bottom_to_top': normal = Δy < 0. Wrong lane = Δy > abs(WRONG_LANE_DELTA_Y) (i.e. > +30 px).
+
+        BUG FIX (Lock Contention): Previously, _save_evidence_crop() (disk I/O) and
+        insert_violation() (SQLite I/O) were called while holding _state_lock, blocking
+        the ingestion thread for the full I/O duration on every violation event.
+        Fixed by collecting violation payloads inside the lock, releasing the lock,
+        then performing all I/O operations outside the critical section.
         """
+        pending_violations: list = []   # (tid, box, delta_y) tuples to log after lock release
+
         with self._state_lock:
             for i, tid in enumerate(track_ids):
                 if tid < 0:
@@ -540,21 +600,30 @@ class VisionPipeline:
                     event_key = (tid, "WrongLane")
                     if event_key not in self._logged_events:
                         self._logged_events.add(event_key)
-                        img_path = self._save_evidence_crop(
-                            canvas, boxes[i], f"wronglane_tid{tid}"
-                        )
-                        insert_violation(
-                            timestamp=self._now(),
-                            violation_type="Wrong Lane",
-                            registration_string=f"TRACK_{tid}",
-                            confidence=float(1.0),
-                            image_path=img_path,
-                        )
-                        logger.info(
-                            "VIOLATION [WrongLane] track_id=%d delta_y=%.1f direction=%s",
-                            tid, delta_y, self.flow_direction,
-                        )
+                        # Queue violation data; perform I/O OUTSIDE the lock (see below)
+                        pending_violations.append((tid, boxes[i].copy(), delta_y))
+                        # Add highlight
+                        self._active_highlights[tid] = {
+                            "box": boxes[i].copy(),
+                            "type": "Wrong Lane",
+                            "frames_left": 45
+                        }
                     state.wrong_lane_cooldown = WRONG_LANE_COOLDOWN
+
+        # ── Perform disk + DB I/O outside the state lock ──────────────────
+        for tid, box, delta_y in pending_violations:
+            img_path = self._save_evidence_crop(canvas, box, f"wronglane_tid{tid}")
+            insert_violation(
+                timestamp=self._now(),
+                violation_type="Wrong Lane",
+                registration_string=f"TRACK_{tid}",
+                confidence=float(1.0),
+                image_path=img_path,
+            )
+            logger.info(
+                "VIOLATION [WrongLane] track_id=%d delta_y=%.1f direction=%s",
+                tid, delta_y, self.flow_direction,
+            )
 
     # ------------------------------------------------------------------ #
     #  Step 5b — Triple riding & head/helmet isolation                     #
@@ -601,15 +670,20 @@ class VisionPipeline:
                     )
                     insert_violation(
                         timestamp=self._now(),
-                        violation_type="Triple Riding",
+                        violation_type="Triple Riding / No Helmet",
                         registration_string=f"TRACK_{moto_tid}",
                         confidence=float(rider_count / (MAX_RIDERS + 1)),
                         image_path=img_path,
                     )
                     logger.info(
-                        "VIOLATION [TripleRiding] moto_tid=%d riders_detected=%d",
+                        "VIOLATION [TripleRiding/Helmet] moto_tid=%d riders_detected=%d",
                         moto_tid, rider_count,
                     )
+                    self._active_highlights[moto_tid] = {
+                        "box": boxes[mi].copy(),
+                        "type": "Triple Riding/Helmet",
+                        "frames_left": 45
+                    }
 
             # ── Head/helmet zone extraction for each overlapping person ────
             for pi in overlapping_persons:
@@ -718,13 +792,21 @@ class VisionPipeline:
                         timestamp=self._now(),
                         violation_type="Seatbelt/Phone Violation",
                         registration_string=f"TRACK_{tid}",
-                        confidence=round(mean_gradient / 100.0, 3),
+                        # BUG FIX: Clamp confidence to [0, 1]. Sobel gradient magnitudes
+                        # on busy cabin regions can exceed 100, producing values > 1.0
+                        # (e.g. gradient=350 → 3.5) which breaks the DB's semantic range.
+                        confidence=min(1.0, round(mean_gradient / 100.0, 3)),
                         image_path=img_path,
                     )
                     logger.info(
                         "VIOLATION [Seatbelt/Phone] tid=%d bright=%.1f gradient=%.1f",
                         tid, mean_bright, mean_gradient,
                     )
+                    self._active_highlights[tid] = {
+                        "box": boxes[i].copy(),
+                        "type": "Seatbelt/Phone",
+                        "frames_left": 45
+                    }
 
     # ------------------------------------------------------------------ #
     #  Step 6 — Adaptive signal density update                             #
@@ -841,6 +923,73 @@ class VisionPipeline:
             cv2.LINE_AA,
         )
         return canvas
+
+    def _draw_highlights(self, canvas: np.ndarray) -> np.ndarray:
+        """Draws red bounding boxes around violating vehicles."""
+        expired_tids = []
+        for tid, highlight in self._active_highlights.items():
+            if highlight["frames_left"] <= 0:
+                expired_tids.append(tid)
+                continue
+                
+            box = highlight["box"]
+            violation_type = highlight["type"]
+            x1, y1, x2, y2 = (int(v) for v in box)
+            
+            # Draw red bounding box
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            
+            # Draw label background and text
+            label = f"VIOLATION: {violation_type}"
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(canvas, (x1, y1 - 20), (x1 + w, y1), (0, 0, 255), -1)
+            cv2.putText(canvas, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            
+            highlight["frames_left"] -= 1
+
+        for tid in expired_tids:
+            del self._active_highlights[tid]
+            
+        return canvas
+
+    @staticmethod
+    def _is_emergency_vehicle(crop: np.ndarray) -> bool:
+        """
+        Heuristic to guess if a vehicle crop is a fire truck (red) or ambulance (white with red).
+        This helps prevent normal trucks/travelers from triggering emergency overrides.
+        """
+        if crop.size == 0:
+            return False
+            
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # Red color ranges in HSV (Hue wraps around 0-180 in OpenCV)
+        lower_red1 = np.array([0, 70, 50])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([160, 70, 50])
+        upper_red2 = np.array([179, 255, 255])
+        
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        
+        # White color range
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 40, 255])
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+        
+        total_pixels = crop.shape[0] * crop.shape[1]
+        red_ratio = cv2.countNonZero(mask_red) / total_pixels
+        white_ratio = cv2.countNonZero(mask_white) / total_pixels
+        
+        # Fire truck: mostly red
+        if red_ratio > 0.25:
+            return True
+        # Ambulance: mostly white with some red
+        if white_ratio > 0.35 and red_ratio > 0.02:
+            return True
+            
+        return False
 
 
 # ---------------------------------------------------------------------------
