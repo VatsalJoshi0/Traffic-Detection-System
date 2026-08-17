@@ -35,12 +35,17 @@ SentinelVision_Production/
 ├── backend/
 │   ├── vision_pipeline.py  # Computer vision inference & detection pipeline
 │   ├── database.py         # SQLite database management & traffic logs
-│   └── server.py           # REST API & background processing service
+│   └── server.py           # FastAPI REST API & background processing service
 ├── frontend/
 │   └── app.py              # Streamlit Web UI dashboard
-├── models/                 # Pre-trained YOLO models & weights
+├── models/                 # Pre-trained YOLO models & weights (auto-downloaded)
 ├── assets/                 # Evidence crop snapshots & sample video files
-└── sentinel_vision.db      # Local SQLite database
+│   ├── evidence_crops/     # Real-time violation snapshot crops (auto-generated)
+│   └── sample_videos/      # Demo & benchmark video streams
+├── sentinel_vision.db      # Local SQLite database (auto-generated at runtime)
+├── requirements.txt        # Production Python dependencies
+├── EVALUATION_AND_TEST_REPORT.md # Comprehensive test & benchmark report
+└── LICENSE                 # MIT License
 ```
 
 ---
@@ -50,7 +55,7 @@ SentinelVision_Production/
 ### 1. Prerequisites
 - **Python 3.9+** installed
 - **Git**
-- **NVIDIA GPU + CUDA** (Optional, for higher FPS detection)
+- **NVIDIA GPU + CUDA** (Optional, for accelerated GPU inference)
 
 ### 2. Clone the Repository
 ```bash
@@ -72,29 +77,36 @@ source venv/bin/activate
 ### 4. Install Dependencies
 ```bash
 pip install -r requirements.txt
-# Or install core packages:
-pip install ultralytics opencv-python streamlit pandas pillow
 ```
+
+> **Note on Model Weights**: Standard YOLOv8 weights (`yolov8n.pt`) are downloaded automatically by the pipeline on first launch. You can also place custom fine-tuned weights directly in the `models/` directory.
 
 ---
 
 ## 🚀 Running the Application
 
-### Launch the Streamlit Frontend Dashboard:
+### 1. Launch the Streamlit Frontend Dashboard:
 ```bash
 streamlit run frontend/app.py
 ```
 Open your browser and navigate to `http://localhost:8501`.
 
-### (Optional) Launch Backend Service / Database Engine:
+### 2. (Optional) Launch the FastAPI Backend Service:
 ```bash
 python backend/server.py
 ```
+API docs and endpoints will be available at `http://localhost:8000/docs`.
+
+---
+
+## 📊 Evaluation & Benchmarks
+
+For in-depth performance benchmarks, mean Average Precision (mAP), inference latency, and violation detection test results, see the [Evaluation and Test Report](EVALUATION_AND_TEST_REPORT.md).
 
 ---
 
 ## 📄 License & Acknowledgments
 
-Distributed under the **MIT License**. See `LICENSE` for more information.
+Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for more information.
 
 Developed for smart city traffic management and intelligent transportation monitoring.

@@ -78,7 +78,7 @@ def insert_violation(
     confidence: float, 
     image_path: str, 
     status: str = 'Pending'
-) -> int:
+) -> int | None:
     """
     Inserts a new violation record into the database in a thread-safe manner.
     Returns the generated primary key (id).
@@ -104,7 +104,7 @@ def insert_accident(
     severity_level: int, 
     description: str, 
     lat_long_mock: str
-) -> int:
+) -> int | None:
     """
     Inserts a new accident record into the database in a thread-safe manner.
     Returns the generated primary key (id).
@@ -150,7 +150,7 @@ def update_signal_metrics(
     junction_name: str, 
     current_density: float, 
     allocated_green_time: int
-) -> int:
+) -> int | None:
     """
     Updates the traffic signal metrics for a given junction.
     If the junction does not exist, it inserts a new record.

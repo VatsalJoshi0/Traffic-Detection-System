@@ -1,0 +1,17 @@
+# SentinelVision AI Dependencies
+
+# Computer Vision & Deep Learning
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Backend Service & REST API
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# Frontend & Interactive Dashboard
+streamlit>=1.30.0
+pandas>=2.0.0
+requests>=2.31.0
